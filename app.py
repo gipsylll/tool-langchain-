@@ -10,7 +10,7 @@ import plotly.io as pio
 import streamlit as st
 from dotenv import load_dotenv
 
-from data_analyst.agent import check_connection, run_gemini
+from data_analyst.agent import OPENAI_ENDPOINT, check_connection, run_api_agent, run_gemini
 from data_analyst.codex_backend import (
     DEFAULT_CODEX_EFFORT,
     DEFAULT_CODEX_MODEL,
@@ -65,8 +65,10 @@ if not sessions and (ROOT / "data/demo_sales.csv").exists():
 with st.sidebar:
     st.markdown("### AI Data Analyst")
     st.caption("Локальные расчёты · облачный интеллект")
-    mode_label = st.radio("Как работаем", ["Через ChatGPT / Codex", "Gemini API"])
-    mode = "codex" if mode_label == "Через ChatGPT / Codex" else "gemini"
+    mode_label = st.radio("Как работаем", ["Через ChatGPT / Codex", "Gemini API", "Другой API"])
+    mode = {"Через ChatGPT / Codex": "codex", "Gemini API": "gemini", "Другой API": "api"}[
+        mode_label
+    ]
     page = st.radio("Раздел", ["Анализ", "Обзор", "Данные", "Настройки"])
     st.divider()
     if sessions:
@@ -105,16 +107,18 @@ with st.sidebar:
                 "Codex запускается автоматически по кнопке. "
                 f"Режим: {st.session_state.get('codex_effort', DEFAULT_CODEX_EFFORT)}."
             )
-    else:
+    elif mode == "gemini":
         st.caption(
             "Gemini получает вопрос, схему, примеры и результаты инструментов через API Google."
         )
+    else:
+        st.caption("Выбранный API получает вопрос, схему, примеры и результаты инструментов.")
 
 st.title("Рабочее пространство аналитика")
 st.caption("Вопрос → вычисления → таблица и график → вывод с источниками")
 
 if page == "Настройки":
-    st.subheader("Два способа работы")
+    st.subheader("Подключения")
     st.markdown(
         "**Codex:** приложение сразу запускает облачный Codex CLI с вашей авторизацией ChatGPT. "
         "Это отдельная сессия, а не обращение в текущий чат. Модель готовит план, "
@@ -181,6 +185,42 @@ if page == "Настройки":
                     st.info(check_connection(model_name, api_key))
         else:
             st.success("Настройки применены.")
+    st.markdown(
+        "**Другой API:** облачная модель с OpenAI-совместимым API и поддержкой Tool Calling. "
+        "Проверьте адрес провайдера перед вводом ключа."
+    )
+    with st.form("api_settings"):
+        api_base_url = st.text_input(
+            "API: базовый URL", value=st.session_state.get("api_base_url", OPENAI_ENDPOINT)
+        )
+        api_model_name = st.text_input(
+            "API: имя модели", value=st.session_state.get("api_model", "")
+        )
+        api_secret = st.text_input(
+            "API-ключ", type="password", value=st.session_state.get("api_key", "")
+        )
+        st.caption("Ключ хранится в памяти этой сессии и отправляется указанному API.")
+        save_api = st.form_submit_button("Применить настройки API")
+        check_api = st.form_submit_button("Применить и проверить API")
+    if save_api or check_api:
+        st.session_state.api_base_url = api_base_url.strip()
+        st.session_state.api_model = api_model_name.strip()
+        st.session_state.api_key = api_secret.strip()
+        if check_api:
+            if not api_secret.strip() or not api_model_name.strip():
+                st.warning("Введите ключ и имя модели API.")
+            else:
+                with st.spinner("Проверяем соединение..."):
+                    st.info(
+                        check_connection(
+                            api_model_name,
+                            api_secret,
+                            provider="OpenAI-compatible",
+                            base_url=api_base_url,
+                        )
+                    )
+        else:
+            st.success("Настройки API применены.")
     st.stop()
 
 if session_id is None:
@@ -236,22 +276,44 @@ if page == "Анализ":
         submitted = st.form_submit_button(
             ("Сохранить вопрос для чата" if codex_manual else "Запустить Codex")
             if mode == "codex"
-            else "Запустить Gemini",
+            else "Запустить Gemini"
+            if mode == "gemini"
+            else "Запустить API",
             type="primary",
             key="submit_question",
         )
     if submitted:
-        key = st.session_state.get("gemini_key", os.getenv("GEMINI_API_KEY", ""))
-        model = st.session_state.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+        key = (
+            st.session_state.get("api_key", "")
+            if mode == "api"
+            else st.session_state.get("gemini_key", os.getenv("GEMINI_API_KEY", ""))
+        )
+        model = (
+            st.session_state.get("api_model", "")
+            if mode == "api"
+            else st.session_state.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+        )
         if not question.strip():
             st.warning("Введите вопрос.")
         elif mode == "gemini" and not key:
             st.warning("Укажите Gemini API-ключ в разделе «Настройки».")
+        elif mode == "api" and (not key or not model):
+            st.warning("Укажите API-ключ и имя модели в разделе «Настройки».")
         else:
             run_id = workspace.submit(session_id, question, mode)
             if mode == "gemini":
                 with st.spinner("Gemini выполняет анализ и вызывает локальные инструменты..."):
                     run_gemini(workspace, run_id, model, key)
+            elif mode == "api":
+                with st.spinner("Модель выполняет анализ и вызывает локальные инструменты..."):
+                    run_api_agent(
+                        workspace,
+                        run_id,
+                        model,
+                        key,
+                        provider="OpenAI-compatible",
+                        base_url=st.session_state.get("api_base_url", OPENAI_ENDPOINT),
+                    )
             elif not codex_manual:
                 if start_codex(
                     workspace,

@@ -117,3 +117,37 @@ def test_failed_codex_can_be_retried_without_losing_original(tmp_path, monkeypat
     assert workspace.run(failed)["status"] == "failed"
     assert len(workspace.runs()) == 2
     st.cache_resource.clear()
+
+
+def test_other_api_mode_uses_configured_provider(tmp_path, monkeypatch):
+    from data_analyst import agent
+
+    monkeypatch.setenv("ANALYST_DATA_DIR", str(tmp_path))
+    calls = []
+
+    def run(workspace, run_id, model_name, api_key, *, provider, base_url):
+        calls.append((run_id, model_name, api_key, provider, base_url))
+        workspace.fail(run_id, "Тест завершён")
+        return workspace.run(run_id)
+
+    monkeypatch.setattr(agent, "run_api_agent", run)
+    st.cache_resource.clear()
+    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
+    app.session_state["api_model"] = "vendor/model"
+    app.session_state["api_key"] = "fake-key"
+    app.session_state["api_base_url"] = "https://api.example.test/v1"
+    app.run(timeout=20)
+    next(r for r in app.radio if r.label == "Как работаем").set_value("Другой API").run()
+    assert app.button(key="submit_question").label == "Запустить API"
+    app.text_area[0].input("Посчитай выручку")
+    app.button(key="submit_question").click().run()
+    assert not app.exception
+    assert len(calls) == 1
+    assert calls[0][1:] == (
+        "vendor/model",
+        "fake-key",
+        "OpenAI-compatible",
+        "https://api.example.test/v1",
+    )
+    assert Workspace(tmp_path).run(calls[0][0])["mode"] == "api"
+    st.cache_resource.clear()

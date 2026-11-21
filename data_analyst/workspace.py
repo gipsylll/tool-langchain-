@@ -87,8 +87,8 @@ class Workspace:
         self, session_id: str, question: str, mode: str, request_id: str | None = None
     ) -> str:
         self.session(session_id)
-        if mode not in {"codex", "gemini"} or not question.strip() or len(question) > 6000:
-            raise ValueError("Нужен вопрос до 6000 символов и режим codex/gemini")
+        if mode not in {"codex", "gemini", "api"} or not question.strip() or len(question) > 6000:
+            raise ValueError("Нужен вопрос до 6000 символов и режим codex/gemini/api")
         question = question.strip()
         run_id = request_id or new_id()
         with self.db() as db:
