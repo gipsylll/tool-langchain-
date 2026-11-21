@@ -3,7 +3,7 @@ import json
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from data_analyst.agent import AgentContext, build_graph, build_model
+from data_analyst.agent import AgentContext, build_graph, build_model, make_tools
 from data_analyst.workspace import Workspace
 
 
@@ -69,3 +69,12 @@ def test_model_without_computation_cannot_finish(tmp_path):
 def test_gemini_uses_only_official_endpoint():
     with pytest.raises(ValueError, match="официальный"):
         build_model("Gemini", "gemini-example", "secret", "http://localhost.example.com")
+
+
+def test_tool_schemas_describe_arguments(tmp_path):
+    tools = {tool.name: tool for tool in make_tools(AgentContext(Workspace(tmp_path), "run"))}
+    code = tools["execute_python"].args["code"]
+    assert "result" in code["description"]
+    chart_type = tools["create_chart"].args["chart_type"]
+    assert set(chart_type["enum"]) == {"bar", "line", "area", "scatter"}
+    assert "вычислений" in tools["publish_answer"].description

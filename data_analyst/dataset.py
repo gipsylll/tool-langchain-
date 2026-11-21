@@ -1,13 +1,10 @@
-"""Загрузка и компактный обзор пользовательских CSV/XLSX."""
-
-from __future__ import annotations
-
 import csv
 import io
 import json
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 import pandas as pd
 
@@ -42,9 +39,68 @@ def normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_datetime64_any_dtype(frame[col]):
             continue
         converted = pd.to_datetime(frame[col], errors="coerce")
-        if converted.notna().sum() >= max(1, int(frame[col].notna().sum() * 0.95)):
+        non_null = int(frame[col].notna().sum())
+        if non_null and int(converted.notna().sum()) * 20 >= non_null * 19:
             frame[col] = converted
     return frame
+
+
+def _identifier_types(columns: list[str]) -> dict[str, str]:
+    return {col: "string" for col in columns if col.lower() == "id" or col.lower().endswith("_id")}
+
+
+def _read_csv(contents: bytes) -> pd.DataFrame:
+    try:
+        source = contents.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            source = contents.decode("cp1251")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Не удалось прочитать кодировку CSV") from exc
+    try:
+        separator = csv.Sniffer().sniff(source[:4096], delimiters=",;\t").delimiter
+    except csv.Error:
+        separator = ","
+    columns = [
+        col.strip() for col in next(csv.reader(io.StringIO(source), delimiter=separator), [])
+    ]
+    _validate_headers(columns)
+    return pd.read_csv(
+        io.StringIO(source),
+        sep=separator,
+        low_memory=False,
+        nrows=MAX_ROWS + 1,
+        dtype=_identifier_types(columns),
+        names=columns,
+        header=0,
+    )
+
+
+def _read_xlsx(contents: bytes) -> pd.DataFrame:
+    from openpyxl import load_workbook
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(contents)) as archive:
+            if sum(item.file_size for item in archive.infolist()) > 150 * 1024 * 1024:
+                raise ValueError("Распакованный XLSX превышает 150 MiB")
+        book = load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
+        try:
+            headers = next(book.worksheets[0].iter_rows(max_row=1, values_only=True), ())
+            columns = [str(col).strip() if col is not None else "" for col in headers]
+            _validate_headers(columns)
+        finally:
+            book.close()
+        return pd.read_excel(
+            io.BytesIO(contents),
+            engine="openpyxl",
+            nrows=MAX_ROWS + 1,
+            names=columns,
+            dtype=_identifier_types(columns),
+        )
+    except zipfile.BadZipFile as exc:
+        raise ValueError(
+            "Не удалось прочитать XLSX: файл повреждён или имеет неверный формат"
+        ) from exc
 
 
 def load_dataset(contents: bytes, filename: str) -> Dataset:
@@ -52,55 +108,9 @@ def load_dataset(contents: bytes, filename: str) -> Dataset:
         raise ValueError("Файл превышает 30 МБ")
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
-        try:
-            source = contents.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            source = contents.decode("cp1251")
-        try:
-            dialect = csv.Sniffer().sniff(source[:4096], delimiters=",;\t")
-            sep = dialect.delimiter
-        except csv.Error:
-            sep = ","
-        columns = next(csv.reader(io.StringIO(source), delimiter=sep), [])
-        columns = [col.strip() for col in columns]
-        _validate_headers(columns)
-        id_types = {
-            col: "string" for col in columns if col.lower() == "id" or col.lower().endswith("_id")
-        }
-        frame = pd.read_csv(
-            io.StringIO(source),
-            sep=sep,
-            low_memory=False,
-            nrows=MAX_ROWS + 1,
-            dtype=id_types,
-            names=columns,
-            header=0,
-        )
+        frame = _read_csv(contents)
     elif suffix == ".xlsx":
-        from openpyxl import load_workbook
-
-        with zipfile.ZipFile(io.BytesIO(contents)) as archive:
-            if sum(item.file_size for item in archive.infolist()) > 150 * 1024 * 1024:
-                raise ValueError("Распакованный XLSX превышает 150 MiB")
-        book = load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
-        try:
-            sheet = book.worksheets[0]
-            headers = next(sheet.iter_rows(max_row=1, values_only=True), ())
-            columns = [str(col).strip() if col is not None else "" for col in headers]
-            _validate_headers(columns)
-        finally:
-            book.close()
-        frame = pd.read_excel(
-            io.BytesIO(contents),
-            engine="openpyxl",
-            nrows=MAX_ROWS + 1,
-            names=columns,
-            dtype={
-                col: "string"
-                for col in columns
-                if col.lower() == "id" or col.lower().endswith("_id")
-            },
-        )
+        frame = _read_xlsx(contents)
     else:
         raise ValueError("Поддерживаются только CSV и XLSX")
     return Dataset(filename, normalize_frame(frame))
@@ -117,8 +127,29 @@ def json_dump(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-def brief_profile(frame: pd.DataFrame, sample_count: int = 3) -> dict:
-    info = {
+class ColumnProfile(TypedDict):
+    name: str
+    type: str
+    missing: int
+    unique: int
+
+
+class DateRange(TypedDict):
+    min: str
+    max: str
+
+
+class DatasetProfile(TypedDict):
+    rows: int
+    columns: list[ColumnProfile]
+    duplicate_rows: int
+    sample: list[dict[str, str]]
+    date_ranges: dict[str, DateRange]
+    numeric_summary: dict
+
+
+def brief_profile(frame: pd.DataFrame, sample_count: int = 3) -> DatasetProfile:
+    info: DatasetProfile = {
         "rows": len(frame),
         "columns": [
             {
@@ -130,6 +161,8 @@ def brief_profile(frame: pd.DataFrame, sample_count: int = 3) -> dict:
             for col in frame.columns
         ],
         "duplicate_rows": int(frame.duplicated().sum()),
+        "date_ranges": {},
+        "numeric_summary": {},
         "sample": frame.head(sample_count)
         .astype(str)
         .map(lambda value: value[:512])

@@ -1,7 +1,3 @@
-"""Общие локальные данные и инструменты для UI, Gemini, CLI и MCP."""
-
-from __future__ import annotations
-
 import io
 import json
 import os
@@ -14,7 +10,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
 
 from data_analyst.dataset import brief_profile, json_dump, load_dataset
 from data_analyst.runner import execute_code
@@ -51,6 +46,8 @@ class Workspace:
                     run_id TEXT PRIMARY KEY, stage TEXT NOT NULL, message TEXT NOT NULL,
                     started REAL NOT NULL, updated REAL NOT NULL,
                     model TEXT NOT NULL, effort TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
             """)
 
     @contextmanager
@@ -92,8 +89,10 @@ class Workspace:
         self.session(session_id)
         if mode not in {"codex", "gemini"} or not question.strip() or len(question) > 6000:
             raise ValueError("Нужен вопрос до 6000 символов и режим codex/gemini")
+        question = question.strip()
         run_id = request_id or new_id()
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if old:
                 if (old["session_id"], old["question"], old["mode"]) != (
@@ -105,7 +104,7 @@ class Workspace:
                 return run_id
             db.execute(
                 "INSERT INTO runs(id,session_id,mode,question,status,created) VALUES(?,?,?,?,?,?)",
-                (run_id, session_id, mode, question.strip(), "pending", time.time()),
+                (run_id, session_id, mode, question, "pending", time.time()),
             )
         return run_id
 
@@ -177,10 +176,13 @@ class Workspace:
             ]
 
     def artifact(self, run_id: str, result_id: str) -> dict:
-        for artifact in self.artifacts(run_id):
-            if artifact["id"] == result_id:
-                return artifact
-        raise ValueError("Результат не принадлежит этому запросу")
+        with self.db() as db:
+            row = db.execute(
+                "SELECT * FROM artifacts WHERE id=? AND run_id=?", (result_id, run_id)
+            ).fetchone()
+        if row is None:
+            raise ValueError("Результат не принадлежит этому запросу")
+        return {**dict(row), "payload": json.loads(row["payload"])}
 
     def _save_artifact(self, run_id: str, kind: str, payload: dict) -> str:
         result_id = new_id()
@@ -218,27 +220,7 @@ class Workspace:
                 if name == "inspect_data":
                     response = {"ok": True, **brief_profile(self.frame(run["session_id"]))}
                 elif name == "execute_python":
-                    response = execute_code(
-                        pd.DataFrame(),
-                        arguments["code"],
-                        prepared_path=self.root / f"{run['session_id']}.arrow",
-                    )
-                    value = response.pop("result", None)
-                    if response["ok"] and value is not None:
-                        result_id = self._save_artifact(run_id, value["kind"], value)
-                        response["result_id"] = result_id
-                        if value["kind"] == "table":
-                            records = value["table"]["data"]
-                            response.update(
-                                rows=len(records),
-                                preview=records[:15],
-                                truncated=len(records) > 15,
-                                columns=[f["name"] for f in value["table"]["schema"]["fields"]],
-                            )
-                        else:
-                            response["value"] = value["value"]
-                    elif response["ok"]:
-                        response["warning"] = "Для таблицы/графика присвойте итог переменной result"
+                    response = self._execute(run_id, run["session_id"], arguments["code"])
                 elif name == "create_chart":
                     response = self._chart(run_id, **arguments)
                 else:
@@ -252,6 +234,30 @@ class Workspace:
                 )
             return response
 
+    def _execute(self, run_id: str, session_id: str, code: str) -> dict:
+        response = execute_code(
+            pd.DataFrame(),
+            code,
+            prepared_path=self.root / f"{session_id}.arrow",
+        )
+        value = response.pop("result", None)
+        if response["ok"] and value is not None:
+            result_id = self._save_artifact(run_id, value["kind"], value)
+            response["result_id"] = result_id
+            if value["kind"] == "table":
+                records = value["table"]["data"]
+                response.update(
+                    rows=len(records),
+                    preview=records[:15],
+                    truncated=len(records) > 15,
+                    columns=[f["name"] for f in value["table"]["schema"]["fields"]],
+                )
+            else:
+                response["value"] = value["value"]
+        elif response["ok"]:
+            response["warning"] = "Для таблицы/графика присвойте итог переменной result"
+        return response
+
     def _chart(
         self,
         run_id: str,
@@ -261,6 +267,8 @@ class Workspace:
         chart_type: str = "bar",
         title: str = "Результат анализа",
     ) -> dict:
+        import plotly.express as px
+
         artifact = self.artifact(run_id, result_id)
         if artifact["kind"] != "table":
             raise ValueError("Для графика нужен табличный result_id")

@@ -16,6 +16,7 @@ dependencies = [
     "python-dotenv>=1,<2",
     "pyarrow>=19,<27",
     "mcp>=1.20,<2",
+    "basedpyright>=1.40.2",
 ]
 
 [dependency-groups]

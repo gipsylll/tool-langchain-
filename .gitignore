@@ -10,3 +10,5 @@ __pycache__/
 dist/
 .agents
 .claude
+.uv-cache
+.streamlit

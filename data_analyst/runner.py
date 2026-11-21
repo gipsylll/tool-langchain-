@@ -8,13 +8,24 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from data_analyst.runner_worker import WorkerResponse
+
+
+class RunnerError(TypedDict):
+    ok: Literal[False]
+    error: str
+
 
 # Подмножество API Pandas/NumPy, достаточное для анализа продаж.
 ALLOWED_ATTRS = {
@@ -159,9 +170,10 @@ def validate_code(code: str) -> None:
         tree = ast.parse(code, mode="exec")
     except SyntaxError as exc:
         raise ValueError(f"Неверный синтаксис Python: {exc.msg}") from exc
-    if len(list(ast.walk(tree))) > 550:
+    nodes = list(ast.walk(tree))
+    if len(nodes) > 550:
         raise ValueError("Слишком сложный код")
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, FORBIDDEN_NODES):
             raise ValueError(f"Конструкция {node.__class__.__name__} запрещена")
         if isinstance(node, ast.Name) and (
@@ -202,14 +214,16 @@ def execute_code(
     timeout: int = 12,
     *,
     prepared_path: Path | None = None,
-) -> dict:
+) -> WorkerResponse | RunnerError:
     try:
         validate_code(code)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     with tempfile.TemporaryDirectory(prefix="ai_data_analysis_") as dirname:
         folder = Path(dirname)
-        data_path = prepared_path or folder / "dataset.arrow"
+        data_path = (
+            prepared_path.resolve() if prepared_path is not None else folder / "dataset.arrow"
+        )
         if prepared_path is None:
             frame.to_feather(data_path)
         env = {
@@ -240,9 +254,30 @@ def execute_code(
             return {"ok": False, "error": f"Превышен лимит выполнения: {timeout} с"}
     if completed.returncode != 0:
         return {"ok": False, "error": (completed.stderr or "Ошибка процесса")[-2000:]}
-    import json
-
     try:
-        return json.loads(completed.stdout)
+        response = json.loads(completed.stdout)
     except (ValueError, TypeError):
         return {"ok": False, "error": "Worker вернул неверный формат результата"}
+    if (
+        not isinstance(response, dict)
+        or response.get("ok") is not True
+        or not isinstance(response.get("stdout"), str)
+        or "result" not in response
+    ):
+        return {"ok": False, "error": "Worker вернул неверный формат результата"}
+    result = response["result"]
+    if result is not None and (
+        not isinstance(result, dict)
+        or not isinstance(result.get("kind"), str)
+        or result["kind"] not in {"table", "scalar"}
+        or (result.get("kind") == "table" and not isinstance(result.get("table"), dict))
+        or (
+            result.get("kind") == "scalar"
+            and (
+                "value" not in result
+                or not isinstance(result["value"], (int, float, str, type(None)))
+            )
+        )
+    ):
+        return {"ok": False, "error": "Worker вернул неверный формат результата"}
+    return cast("WorkerResponse", response)

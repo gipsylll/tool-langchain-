@@ -37,3 +37,42 @@ def test_chart_groups_correctly(sales):
 def test_chart_rejects_unknown_col(sales):
     with pytest.raises(ValueError):
         aggregate_chart_data(sales, "bad", "revenue")
+
+
+def test_mom_marks_missing_month_and_zero_base_separately():
+    frame = pd.DataFrame(
+        {
+            "date": ["2026-01-01", "2026-03-01", "2026-04-01", "2026-05-01"],
+            "revenue": [100, 200, 0, 50],
+        }
+    )
+    report = detect_mom_anomalies(frame, "date", "revenue")
+    months = {row["month"]: row for row in report["monthly_values"]}
+    assert months["2026-03"]["comparison_status"] == "missing_previous_month"
+    assert months["2026-03"]["previous"] is None
+    assert months["2026-03"]["change_pct"] is None
+    assert months["2026-05"]["comparison_status"] == "zero_base"
+    assert months["2026-05"]["change_pct"] is None
+    assert [row["month"] for row in report["anomalies"]] == ["2026-04"]
+
+
+def test_mom_group_gaps_and_missing_values_are_not_zero():
+    frame = pd.DataFrame(
+        {
+            "date": ["2026-01-01", "2026-02-01", "2026-03-01", "2026-01-01", "2026-03-01"],
+            "group": ["A", "A", "A", "B", "B"],
+            "amount": [5, None, 10, 20, 40],
+        }
+    )
+    report = detect_mom_anomalies(frame, "date", "amount", group_by="group")
+    rows = {(row["group"], row["month"]): row for row in report["monthly_values"]}
+    assert rows[("A", "2026-02")]["amount"] is None
+    assert rows[("A", "2026-03")]["comparison_status"] == "missing_value"
+    assert rows[("B", "2026-03")]["comparison_status"] == "missing_previous_month"
+    assert report["total_found"] == 0
+
+
+def test_aggregation_preserves_all_missing_as_missing():
+    frame = pd.DataFrame({"category": ["A"], "amount": [float("nan")]})
+    result = aggregate_chart_data(frame, "category", "amount")
+    assert pd.isna(result.iloc[0]["value"])

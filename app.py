@@ -1,7 +1,3 @@
-"""Локальное рабочее пространство: Codex / ChatGPT или Gemini API."""
-
-from __future__ import annotations
-
 import hashlib
 import io
 import os
@@ -41,19 +37,19 @@ h1 {letter-spacing: -.05em; font-weight: 750;}
 
 
 @st.cache_resource
-def get_workspace():
+def get_workspace() -> Workspace:
     return Workspace()
 
 
 workspace = get_workspace()
 
 
-@st.cache_data(show_spinner=False)
-def get_frame(session_id: str):
+@st.cache_data(show_spinner=False, max_entries=8)
+def get_frame(session_id: str) -> pd.DataFrame:
     return workspace.frame(session_id)
 
 
-def load_file(contents, name):
+def load_file(contents: bytes, name: str) -> None:
     marker = hashlib.sha256(contents + name.encode()).hexdigest()
     loaded = st.session_state.setdefault("loaded_datasets", {})
     if marker not in loaded:
@@ -61,8 +57,10 @@ def load_file(contents, name):
     st.session_state.pending_session = loaded[marker]
 
 
-if not workspace.sessions() and (ROOT / "data/demo_sales.csv").exists():
+sessions = workspace.sessions()
+if not sessions and (ROOT / "data/demo_sales.csv").exists():
     load_file((ROOT / "data/demo_sales.csv").read_bytes(), "demo_sales.csv")
+    sessions = workspace.sessions()
 
 with st.sidebar:
     st.markdown("### AI Data Analyst")
@@ -71,21 +69,23 @@ with st.sidebar:
     mode = "codex" if mode_label == "Через ChatGPT / Codex" else "gemini"
     page = st.radio("Раздел", ["Анализ", "Обзор", "Данные", "Настройки"])
     st.divider()
-    sessions = workspace.sessions()
     if sessions:
         ids = [s["id"] for s in sessions]
-        labels = {s["id"]: f"{s['name']} · {s['id'][:6]}" for s in sessions}
+        names = {s["id"]: s["name"] for s in sessions}
+        labels = {session: f"{name} · {session[:6]}" for session, name in names.items()}
         pending_session = st.session_state.pop("pending_session", None)
         if pending_session in ids:
             st.session_state.selected_session = pending_session
         elif st.session_state.get("selected_session") not in ids:
             st.session_state.selected_session = ids[0]
-        session_id = st.selectbox("Таблица", ids, format_func=labels.get, key="selected_session")
+        session_id = st.selectbox(
+            "Таблица", ids, format_func=lambda item: labels[item], key="selected_session"
+        )
     else:
         session_id = None
     with st.expander("Загрузить данные"):
         upload = st.file_uploader("CSV / XLSX", type=["csv", "xlsx"])
-        if st.button("Открыть таблицу", disabled=upload is None, width="stretch"):
+        if st.button("Открыть таблицу", disabled=upload is None, width="stretch") and upload:
             try:
                 load_file(upload.getvalue(), upload.name)
                 st.rerun()
@@ -188,12 +188,10 @@ if session_id is None:
     st.stop()
 
 frame = get_frame(session_id)
-st.caption(
-    f"{workspace.session(session_id)['name']} · {len(frame):,} строк · {len(frame.columns)} колонок"
-)
+st.caption(f"{names[session_id]} · {len(frame):,} строк · {len(frame.columns)} колонок")
 
 
-def render_artifacts(run_id):
+def render_artifacts(run_id: str) -> None:
     for artifact in workspace.artifacts(run_id):
         payload = artifact["payload"]
         if artifact["kind"] == "chart":
@@ -269,7 +267,7 @@ if page == "Анализ":
                 )
 
     @st.fragment(run_every="1s" if mode == "codex" else None)
-    def history():
+    def history() -> None:
         runs = workspace.runs(session_id)
         if not runs:
             st.info("Начните с вопроса. Ниже появятся ответ, графики и шаги анализа.")

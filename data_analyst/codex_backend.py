@@ -1,11 +1,3 @@
-"""Прямой запуск облачного Codex CLI: план расчёта → локальный worker.
-
-CLI получает только схему/небольшой пример и возвращает структурированный план.
-Расчёты и графики выполняет приложение; отдельная локальная модель не нужна.
-"""
-
-from __future__ import annotations
-
 import json
 import os
 import shutil
@@ -13,12 +5,28 @@ import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal, TypedDict, cast
 
 from data_analyst.codex_transport import run_cli
 from data_analyst.workspace import Workspace
 
 DEFAULT_CODEX_MODEL = "gpt-6-luna"
 DEFAULT_CODEX_EFFORT = "low"
+
+
+class ChartPlan(TypedDict):
+    x: str
+    y: str
+    chart_type: Literal["line", "bar", "area", "scatter"]
+    title: str
+
+
+class AnalysisPlan(TypedDict):
+    title: str
+    calculation: str
+    code: str
+    chart: ChartPlan | None
+
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -95,13 +103,34 @@ def resolve_model(model: str) -> str:
     raise ValueError("Не удалось определить короткое имя модели. Укажите полный ID модели Codex.")
 
 
+def _validate_plan(value: object) -> AnalysisPlan:
+    if not isinstance(value, dict) or set(value) != {"title", "calculation", "code", "chart"}:
+        raise ValueError("Codex вернул неверный формат плана.")
+    code = value["code"]
+    if not isinstance(code, str) or not code.strip() or len(code) > 3500:
+        raise ValueError("Код Codex отсутствует или превышает допустимый размер.")
+    for field in ("title", "calculation"):
+        if not isinstance(value[field], str) or len(value[field]) > 1500:
+            raise ValueError("Неверное описание расчёта Codex.")
+    chart = value["chart"]
+    if chart is not None:
+        if (
+            not isinstance(chart, dict)
+            or set(chart) != {"x", "y", "chart_type", "title"}
+            or not all(isinstance(chart[key], str) for key in ("x", "y", "chart_type", "title"))
+            or chart["chart_type"] not in {"line", "bar", "area", "scatter"}
+        ):
+            raise ValueError("Codex вернул неверную спецификацию графика.")
+    return cast(AnalysisPlan, value)
+
+
 def _plan(
     question: str,
     profile: dict,
     effort: str,
     model: str,
     on_stage: Callable[[str, str], None],
-) -> dict:
+) -> AnalysisPlan:
     executable = shutil.which("codex")
     if executable is None:
         raise ValueError("Codex CLI не найден. Установите CLI и выполните codex login.")
@@ -145,12 +174,6 @@ def _plan(
             'approval_policy="never"',
             "-c",
             f'model_reasoning_effort="{effort}"',
-            "-c",
-            "model_providers.openai.request_max_retries=1",
-            "-c",
-            "model_providers.openai.stream_max_retries=1",
-            "-c",
-            "model_providers.openai.stream_idle_timeout_ms=30000",
             "--output-schema",
             str(schema),
             "--output-last-message",
@@ -171,14 +194,7 @@ def _plan(
             plan = json.loads(response)
         except (ValueError, UnicodeError) as exc:
             raise ValueError("Codex вернул неверный формат плана.") from exc
-        if not isinstance(plan, dict) or not isinstance(plan.get("code"), str):
-            raise ValueError("В плане Codex отсутствует код расчёта.")
-        if not 0 < len(plan["code"]) <= 3500:
-            raise ValueError("Код Codex превышает допустимый размер.")
-        for field in ("title", "calculation"):
-            if not isinstance(plan.get(field), str) or len(plan[field]) > 1500:
-                raise ValueError("Неверное описание расчёта Codex.")
-        return plan
+        return _validate_plan(plan)
 
 
 def _process(workspace: Workspace, run_id: str, effort: str, model: str) -> None:

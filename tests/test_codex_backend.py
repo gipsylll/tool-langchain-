@@ -41,6 +41,7 @@ def test_automatic_codex_runs_immediately_and_publishes_chart(case, tmp_path, mo
         "assert '--ignore-user-config' in sys.argv\n"
         "assert sys.argv[sys.argv.index('--sandbox')+1] == 'read-only'\n"
         "assert 'model_reasoning_effort=\"low\"' in sys.argv\n"
+        "assert not any('model_providers.openai.' in arg for arg in sys.argv)\n"
         "assert sys.argv[sys.argv.index('--model')+1] == 'gpt-6-luna'\n"
         "assert 'Сделай график выручки по регионам' in sys.stdin.read()\n"
         "time.sleep(0.4)\n"
@@ -103,3 +104,22 @@ def test_short_model_name_resolves_from_available_cache(tmp_path, monkeypatch):
     assert codex_backend.resolve_model("luna") == "gpt-example-luna"
     assert codex_backend.resolve_model("other-model") == "other-model"
     assert codex_backend.resolve_model("") == "gpt-6-luna"
+
+
+@pytest.mark.parametrize(
+    "chart",
+    [None, {"x": "a", "y": "b", "chart_type": "bar", "title": "Тест"}],
+)
+def test_valid_plan_contract(chart):
+    plan = {"title": "Заголовок", "calculation": "Сумма", "code": "result = 1", "chart": chart}
+    assert codex_backend._validate_plan(plan) == plan
+
+
+@pytest.mark.parametrize(
+    "chart",
+    [{"x": "a"}, {"x": "a", "y": "b", "chart_type": "pie", "title": "x"}, "chart"],
+)
+def test_invalid_chart_is_rejected_before_execution(chart):
+    plan = {"title": "Заголовок", "calculation": "Сумма", "code": "result = 1", "chart": chart}
+    with pytest.raises(ValueError, match="графика"):
+        codex_backend._validate_plan(plan)

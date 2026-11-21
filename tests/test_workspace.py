@@ -99,3 +99,39 @@ def test_budget_is_shared_across_instances(case):
         Workspace(workspace.root).call(run_id, "inspect_data", {})
     with pytest.raises(ValueError, match="бюджет"):
         workspace.call(run_id, "inspect_data", {})
+
+
+def test_submit_idempotency_normalizes_question_and_rejects_conflicts(case):
+    workspace, session, _ = case
+    request_id = workspace.submit(session, "  Выручка?  ", "codex", "request-1")
+    assert workspace.submit(session, "  Выручка?  ", "codex", request_id) == request_id
+    assert workspace.submit(session, "Выручка?", "codex", request_id) == request_id
+    with pytest.raises(ValueError, match="request_id"):
+        workspace.submit(session, "Другой вопрос", "codex", request_id)
+
+
+def test_artifact_lookup_does_not_decode_unrelated_payload(case):
+    workspace, _, run_id = case
+    result_id = workspace._save_artifact(run_id, "scalar", {"value": 7})
+    with workspace.db() as db:
+        db.execute(
+            "INSERT INTO artifacts VALUES (?, ?, ?, ?)", ("bad", run_id, "scalar", "invalid json")
+        )
+    assert workspace.artifact(run_id, result_id)["payload"] == {"value": 7}
+
+
+def test_concurrent_submit_same_request_id(case):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    workspace, session, _ = case
+    barrier = Barrier(2)
+
+    def submit():
+        other = Workspace(workspace.root)
+        barrier.wait()
+        return other.submit(session, "Общий вопрос", "codex", "shared-request")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(submit) for _ in range(2)]
+        assert [future.result() for future in futures] == ["shared-request"] * 2

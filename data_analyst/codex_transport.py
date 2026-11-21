@@ -1,7 +1,3 @@
-"""Читаем события CLI сразу; в UI передаём только фиксированные безопасные статусы."""
-
-from __future__ import annotations
-
 import json
 import os
 import queue
@@ -13,10 +9,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 MAX_OUTPUT = 512 * 1024
+MAX_PLAN_SIZE = 65_536
+MAX_LINE_SIZE = 65_537
 
 
 def diagnostic(text: str) -> str | None:
     lower = text.lower()
+    if "error loading" in lower and "model_provider" in lower:
+        return "Codex не смог загрузить конфигурацию провайдера модели. Проверьте настройки CLI."
     if any(word in lower for word in ("401", "unauthorized", "not logged in", "refresh token")):
         return "Codex не принял авторизацию. Выполните codex login."
     if "429" in lower or "quota" in lower or "rate limit" in lower:
@@ -41,7 +41,7 @@ def diagnostic(text: str) -> str | None:
     return None
 
 
-def _stop(process: subprocess.Popen) -> None:
+def _stop(process: subprocess.Popen[bytes]) -> None:
     if os.name != "posix" and process.poll() is not None:
         return
     try:
@@ -52,23 +52,35 @@ def _stop(process: subprocess.Popen) -> None:
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
+            if os.name != "posix":
                 process.kill()
-            process.wait(timeout=2)
+        if os.name == "posix":
+            # Дочерний процесс может пережить завершившегося родителя и игнорировать SIGTERM.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=2)
     except ProcessLookupError:
         pass
 
 
+def _plan_text(text: object) -> str | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return text if isinstance(value, dict) and isinstance(value.get("code"), str) else None
+
+
 def _file_result(path: Path) -> str | None:
     try:
-        if path.is_file() and 0 < path.stat().st_size <= 65_536:
+        if path.is_file() and 0 < path.stat().st_size <= MAX_PLAN_SIZE:
             text = path.read_text(encoding="utf-8")
-            value = json.loads(text)
-            if isinstance(value, dict) and isinstance(value.get("code"), str):
-                return text
-    except (OSError, ValueError, UnicodeError):
+            return _plan_text(text)
+    except (OSError, UnicodeError):
         pass
     return None
 
@@ -89,13 +101,14 @@ def run_cli(
         start_new_session=True,
         env=env,
     )
-    lines = queue.Queue(maxsize=128)
+    lines: queue.Queue[bytes] = queue.Queue(maxsize=128)
     stopped = threading.Event()
 
-    def reader():
+    def reader() -> None:
+        assert process.stdout is not None
         try:
             while not stopped.is_set():
-                line = process.stdout.readline(65_537)
+                line = process.stdout.readline(MAX_LINE_SIZE)
                 if not line:
                     break
                 while not stopped.is_set():
@@ -107,7 +120,8 @@ def run_cli(
         except (OSError, ValueError):
             pass
 
-    def writer():
+    def writer() -> None:
+        assert process.stdin is not None
         try:
             process.stdin.write(prompt.encode())
             process.stdin.close()
@@ -158,12 +172,9 @@ def run_cli(
                         last_stage = "получение плана от модели"
                         on_stage("receiving", "Получаем план расчёта от Codex")
                         if kind == "item.completed" and item.get("type") == "agent_message":
-                            try:
-                                value = json.loads(item.get("text", ""))
-                                if isinstance(value, dict) and isinstance(value.get("code"), str):
-                                    return item["text"]
-                            except (ValueError, TypeError):
-                                pass
+                            result = _plan_text(item.get("text"))
+                            if result is not None:
+                                return result
                 safe = diagnostic(text) if not event or kind in {"error", "turn.failed"} else None
                 if safe:
                     reason = safe

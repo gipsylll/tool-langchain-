@@ -47,3 +47,21 @@ def test_empty_and_duplicate_xlsx_headers_rejected():
         book.save(output)
         with pytest.raises(ValueError, match="непустыми и уникальными"):
             load_dataset(output.getvalue(), "bad.xlsx")
+
+
+def test_date_conversion_requires_at_least_95_percent_valid():
+    dataset = load_dataset(
+        b"order_date,revenue\n2026-01-01,10\n2026-01-02,20\ninvalid,30\n", "sales.csv"
+    )
+    assert dataset.frame["order_date"].tolist() == ["2026-01-01", "2026-01-02", "invalid"]
+
+
+def test_invalid_xlsx_reports_readable_error():
+    with pytest.raises(ValueError, match="XLSX"):
+        load_dataset(b"not an excel file", "bad.xlsx")
+
+
+def test_semicolon_csv_preserves_identifier():
+    dataset = load_dataset(b"order_id;revenue\n001;10\n002;20\n", "sales.csv")
+    assert dataset.frame["order_id"].tolist() == ["001", "002"]
+    assert dataset.frame["revenue"].tolist() == [10, 20]

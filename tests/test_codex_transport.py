@@ -90,3 +90,36 @@ def test_timeout_cleans_children_after_parent_exited(tmp_path):
             timeout=0.2,
         )
     assert time.monotonic() - start < 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
+def test_stops_child_ignoring_sigterm_after_parent_exits(tmp_path):
+    ready = tmp_path / "ready"
+    marker = tmp_path / "survived"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import pathlib, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "pathlib.Path(sys.argv[1]).touch()\n"
+        "time.sleep(0.8)\n"
+        "pathlib.Path(sys.argv[2]).touch()\n"
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "sys.stdin.read()\n"
+        "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]])\n"
+        "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.01)\n"
+        "print('ordinary output', flush=True)\n"
+    )
+    with pytest.raises(ValueError):
+        run_cli(
+            [sys.executable, str(parent), str(child), str(ready), str(marker)],
+            "test",
+            os.environ.copy(),
+            tmp_path / "plan.json",
+            lambda *args: None,
+            timeout=0.3,
+        )
+    time.sleep(1)
+    assert not marker.exists()
